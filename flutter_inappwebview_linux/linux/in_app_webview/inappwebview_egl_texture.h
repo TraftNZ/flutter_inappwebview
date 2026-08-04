@@ -43,22 +43,6 @@ using WebViewType = InAppWebView;
 InAppWebViewEGLTexture* inappwebview_egl_texture_new(
     flutter_inappwebview_plugin::WebViewType* webview);
 
-/**
- * Updates the texture with a new EGL image.
- *
- * Call this from the WPE export callback when a new frame is available.
- * The texture will bind the EGL image to a GL texture without readback.
- *
- * @param self The texture instance.
- * @param egl_image The EGL image handle (EGLImageKHR).
- * @param width The image width.
- * @param height The image height.
- */
-void inappwebview_egl_texture_set_egl_image(InAppWebViewEGLTexture* self,
-                                            void* egl_image,
-                                            uint32_t width,
-                                            uint32_t height);
-
 G_END_DECLS
 
 #endif  // FLUTTER_INAPPWEBVIEW_PLUGIN_INAPPWEBVIEW_EGL_TEXTURE_H_

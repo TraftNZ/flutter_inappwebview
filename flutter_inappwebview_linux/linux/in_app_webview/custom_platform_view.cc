@@ -136,20 +136,11 @@ CustomPlatformView::CustomPlatformView(FlBinaryMessenger* messenger,
     webview_->AttachChannel(messenger, texture_id_);
   }
 
-  // Set up the webview's callback to mark frame available
-  // For EGL texture, we also update the EGL image reference
-  webview_->SetOnFrameAvailable([this]() {
-    // If using EGL texture, update the EGL image reference before marking available
-    if (egl_texture_ != nullptr && webview_ != nullptr) {
-      uint32_t width = 0;
-      uint32_t height = 0;
-      void* egl_image = webview_->GetCurrentEglImage(&width, &height);
-      if (egl_image != nullptr) {
-        inappwebview_egl_texture_set_egl_image(egl_texture_, egl_image, width, height);
-      }
-    }
-    MarkTextureFrameAvailable();
-  });
+  // Set up the webview's callback to mark frame available. The EGL texture
+  // (when in use) re-imports the current DMA-BUF frame itself inside
+  // populate(), on Flutter's render thread where Flutter's EGLDisplay is
+  // current — see InAppWebView::ImportCurrentBufferToEglImage.
+  webview_->SetOnFrameAvailable([this]() { MarkTextureFrameAvailable(); });
 
   // Set up cursor change callback
   webview_->SetOnCursorChanged(
