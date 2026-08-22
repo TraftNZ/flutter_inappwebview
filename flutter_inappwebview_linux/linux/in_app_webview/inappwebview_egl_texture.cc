@@ -43,6 +43,11 @@ struct _InAppWebViewEGLTexture {
   uint32_t texture_width;   // Current texture dimensions
   uint32_t texture_height;
 
+  // Whether texture_id holds a frame from the webview currently attached. A
+  // recycled texture still owns the previous webview's last frame, which must
+  // not be served as if it were this one's.
+  gboolean content_valid;
+
   // Fallback: pixel buffer for when EGL is not available (SHM mode)
   uint8_t* fallback_buffer;
   size_t fallback_buffer_size;
@@ -109,7 +114,7 @@ static gboolean inappwebview_egl_texture_populate(FlTextureGL* texture, uint32_t
   // CRITICAL: Verify we have a current GL context before any GL operations.
   if (!has_current_gl_context()) {
     // Return cached texture if available
-    if (self->texture_initialized && self->texture_id != 0) {
+    if (self->content_valid && self->texture_initialized && self->texture_id != 0) {
       *target = GL_TEXTURE_2D;
       *name = self->texture_id;
       *out_width = self->texture_width > 0 ? self->texture_width : 1;
@@ -181,6 +186,7 @@ static gboolean inappwebview_egl_texture_populate(FlTextureGL* texture, uint32_t
       // Update tracked dimensions
       self->texture_width = img_width;
       self->texture_height = img_height;
+      self->content_valid = TRUE;
 
       *target = GL_TEXTURE_2D;
       *name = self->texture_id;
@@ -243,6 +249,7 @@ static gboolean inappwebview_egl_texture_populate(FlTextureGL* texture, uint32_t
           glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
           glBindTexture(GL_TEXTURE_2D, 0);
+          self->content_valid = TRUE;
 
           *target = GL_TEXTURE_2D;
           *name = self->texture_id;
@@ -276,43 +283,44 @@ static gboolean inappwebview_egl_texture_populate(FlTextureGL* texture, uint32_t
   return TRUE;
 }
 
-static void inappwebview_egl_texture_dispose(GObject* object) {
+static void inappwebview_egl_texture_finalize(GObject* object) {
   InAppWebViewEGLTexture* self = INAPPWEBVIEW_EGL_TEXTURE(object);
 
-  g_mutex_lock(&self->mutex);
-
-  // Free fallback buffer
+  // Cleanup belongs in finalize, not dispose: dispose may run more than once,
+  // and clearing the mutex twice — or while populate() still holds it — is
+  // undefined. Finalize runs once, after the last reference is gone.
   if (self->fallback_buffer != nullptr) {
     g_free(self->fallback_buffer);
     self->fallback_buffer = nullptr;
     self->fallback_buffer_size = 0;
   }
 
-  // Note: We don't call glDeleteTextures here because:
-  // 1. The GL context may not be current
-  // 2. Flutter's texture registrar will handle texture cleanup
+  // Note: We don't call glDeleteTextures here because the GL context may not
+  // be current on the thread that drops the last reference.
+  self->webview = nullptr;
   self->texture_id = 0;
   self->texture_initialized = FALSE;
+  self->content_valid = FALSE;
   self->texture_width = 0;
   self->texture_height = 0;
   self->default_texture_id = 0;
   self->default_texture_initialized = FALSE;
 
-  g_mutex_unlock(&self->mutex);
   g_mutex_clear(&self->mutex);
 
-  G_OBJECT_CLASS(inappwebview_egl_texture_parent_class)->dispose(object);
+  G_OBJECT_CLASS(inappwebview_egl_texture_parent_class)->finalize(object);
 }
 
 static void inappwebview_egl_texture_class_init(InAppWebViewEGLTextureClass* klass) {
   FL_TEXTURE_GL_CLASS(klass)->populate = inappwebview_egl_texture_populate;
-  G_OBJECT_CLASS(klass)->dispose = inappwebview_egl_texture_dispose;
+  G_OBJECT_CLASS(klass)->finalize = inappwebview_egl_texture_finalize;
 }
 
 static void inappwebview_egl_texture_init(InAppWebViewEGLTexture* self) {
   self->webview = nullptr;
   self->texture_id = 0;
   self->texture_initialized = FALSE;
+  self->content_valid = FALSE;
   self->texture_width = 0;
   self->texture_height = 0;
   self->fallback_buffer = nullptr;
@@ -332,5 +340,20 @@ InAppWebViewEGLTexture* inappwebview_egl_texture_new(
   self->webview = webview;
   flutter_inappwebview_plugin::debugLog("InAppWebViewEGLTexture: created (zero-copy mode)");
   return self;
+}
+
+void inappwebview_egl_texture_set_webview(
+    InAppWebViewEGLTexture* texture,
+    flutter_inappwebview_plugin::WebViewType* webview) {
+  g_return_if_fail(INAPPWEBVIEW_IS_EGL_TEXTURE(texture));
+
+  g_mutex_lock(&texture->mutex);
+  texture->webview = webview;
+  // The frame still in texture_id belongs to whichever webview was attached
+  // before, so it stops being servable the moment the attachment changes.
+  texture->content_valid = FALSE;
+  texture->texture_width = 0;
+  texture->texture_height = 0;
+  g_mutex_unlock(&texture->mutex);
 }
 
