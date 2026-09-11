@@ -356,4 +356,3 @@ void inappwebview_egl_texture_set_webview(
   texture->texture_height = 0;
   g_mutex_unlock(&texture->mutex);
 }
-
