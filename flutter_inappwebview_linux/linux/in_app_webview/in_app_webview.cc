@@ -1365,47 +1365,7 @@ void InAppWebView::OnWpePlatformBufferRendered(WPEBuffer* buffer) {
     // === Priority 3: Generic pixel import (works for DMA-BUF with GBM device) ===
     // This is a fallback for DMA-BUF when EGL failed but GBM device is available
     if (!buffer_handled) {
-      GError* error = nullptr;
-      GBytes* pixels = wpe_buffer_import_to_pixels(buffer, &error);
-      if (pixels != nullptr) {
-        gsize size;
-        const uint8_t* data = static_cast<const uint8_t*>(g_bytes_get_data(pixels, &size));
-        
-        // Store in pixel buffer for software rendering
-        size_t write_idx = write_buffer_index_.load(std::memory_order_relaxed);
-        auto& pixel_buffer = pixel_buffers_[write_idx];
-        
-        if (pixel_buffer.data.size() != size) {
-          pixel_buffer.data.resize(size);
-        }
-        memcpy(pixel_buffer.data.data(), data, size);
-        
-        // GBM pixel import also returns ARGB8888, convert to RGBA
-        uint32_t stride = buf_width * 4;
-        ConvertARGB32ToRGBA(pixel_buffer.data.data(),
-                            pixel_buffer.data.data(),
-                            buf_width, buf_height,
-                            stride);
-        
-        pixel_buffer.width = buf_width;
-        pixel_buffer.height = buf_height;
-        
-        // Swap buffers
-        {
-          std::lock_guard<std::mutex> swap_lock(buffer_swap_mutex_);
-          read_buffer_index_.store(write_idx, std::memory_order_release);
-          write_buffer_index_.store((write_idx + 1) % kNumBuffers, std::memory_order_relaxed);
-        }
-        
-        g_bytes_unref(pixels);
-        current_buffer_width_ = buf_width;
-        current_buffer_height_ = buf_height;
-        buffer_handled = true;
-      } else {
-        if (error != nullptr) {
-          g_clear_error(&error);
-        }
-      }
+      buffer_handled = StorePixelsFromBuffer(buffer, buf_width, buf_height);
     }
     
     if (!buffer_handled) {
@@ -1427,6 +1387,53 @@ void InAppWebView::OnWpePlatformBufferRendered(WPEBuffer* buffer) {
   if (buffer_handled && on_frame_available_) {
     on_frame_available_();
   }
+}
+
+bool InAppWebView::StorePixelsFromBuffer(WPEBuffer* buffer, uint32_t buf_width,
+                                         uint32_t buf_height) {
+  GError* error = nullptr;
+  // Borrowed: the buffer owns and caches the pixels, so they are never unreffed.
+  GBytes* pixels = wpe_buffer_import_to_pixels(buffer, &error);
+  if (pixels == nullptr) {
+    if (error != nullptr) {
+      debugLog("InAppWebView: pixel import failed: " + std::string(error->message));
+      g_clear_error(&error);
+    }
+    return false;
+  }
+
+  gsize size;
+  const uint8_t* data = static_cast<const uint8_t*>(g_bytes_get_data(pixels, &size));
+
+  // Store in pixel buffer for software rendering
+  size_t write_idx = write_buffer_index_.load(std::memory_order_relaxed);
+  auto& pixel_buffer = pixel_buffers_[write_idx];
+
+  if (pixel_buffer.data.size() != size) {
+    pixel_buffer.data.resize(size);
+  }
+  memcpy(pixel_buffer.data.data(), data, size);
+
+  // GBM pixel import also returns ARGB8888, convert to RGBA
+  uint32_t stride = buf_width * 4;
+  ConvertARGB32ToRGBA(pixel_buffer.data.data(),
+                      pixel_buffer.data.data(),
+                      buf_width, buf_height,
+                      stride);
+
+  pixel_buffer.width = buf_width;
+  pixel_buffer.height = buf_height;
+
+  // Swap buffers
+  {
+    std::lock_guard<std::mutex> swap_lock(buffer_swap_mutex_);
+    read_buffer_index_.store(write_idx, std::memory_order_release);
+    write_buffer_index_.store((write_idx + 1) % kNumBuffers, std::memory_order_relaxed);
+  }
+
+  current_buffer_width_ = buf_width;
+  current_buffer_height_ = buf_height;
+  return true;
 }
 #endif
 
@@ -3726,7 +3733,7 @@ void* InAppWebView::GetCurrentEglImage(uint32_t* out_width, uint32_t* out_height
 }
 
 void* InAppWebView::ImportCurrentBufferToEglImage(void* target_display, uint32_t* out_width,
-                                                   uint32_t* out_height) const {
+                                                   uint32_t* out_height) {
   if (out_width)
     *out_width = 0;
   if (out_height)
@@ -3739,7 +3746,8 @@ void* InAppWebView::ImportCurrentBufferToEglImage(void* target_display, uint32_t
 
   std::lock_guard<std::mutex> lock(wpe_buffer_mutex_);
 
-  if (current_buffer_ == nullptr || !WPE_IS_BUFFER_DMA_BUF(current_buffer_)) {
+  if (!skip_pixel_readback_.load() || current_buffer_ == nullptr ||
+      !WPE_IS_BUFFER_DMA_BUF(current_buffer_)) {
     return nullptr;
   }
 
@@ -3807,6 +3815,15 @@ void* InAppWebView::ImportCurrentBufferToEglImage(void* target_display, uint32_t
                                         EGL_LINUX_DMA_BUF_EXT, static_cast<EGLClientBuffer>(nullptr),
                                         attribs.data());
   if (image == EGL_NO_IMAGE_KHR) {
+    // EGL_BAD_MATCH: the display cannot sample this format and modifier, and
+    // never will for this engine — every later frame is the same kind.
+    const EGLint import_error = eglGetError();
+    if (import_error == EGL_BAD_MATCH) {
+      debugLog("InAppWebView: Flutter's EGL display cannot import WebKit's buffers; "
+               "switching to pixel readback");
+      skip_pixel_readback_.store(false);
+      StorePixelsFromBuffer(current_buffer_, current_buffer_width_, current_buffer_height_);
+    }
     return nullptr;
   }
 

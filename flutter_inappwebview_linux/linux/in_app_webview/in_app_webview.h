@@ -320,8 +320,16 @@ class InAppWebView {
   // eglDestroyImageKHR it — safe to do immediately after binding the image
   // to a texture via glEGLImageTargetTexture2DOES. Returns nullptr if the
   // current frame is not a DMA-BUF buffer (e.g. SHM/software mode).
+  //
+  // target_display may be unable to import WPE's buffers at all: WebKit
+  // renders on a GPU and tiles its buffers for it, while Flutter's display can
+  // be a software renderer (e.g. an X server without DRI3, such as Xvnc) that
+  // rejects them with EGL_BAD_MATCH. The first such rejection switches this
+  // webview to pixel readback: the current frame is converted to pixels at
+  // once, every later frame is too, and this returns nullptr from then on so
+  // the texture draws from the pixel buffers instead.
   void* ImportCurrentBufferToEglImage(void* target_display, uint32_t* out_width,
-                                      uint32_t* out_height) const;
+                                      uint32_t* out_height);
 
   // Skip pixel readback - when using zero-copy EGL texture mode, we don't need
   // to read pixels back to CPU. This improves performance and avoids GL context issues.
@@ -540,7 +548,9 @@ class InAppWebView {
   
   // Flag to skip pixel readback when using zero-copy EGL texture mode
   // When true, OnExportDmaBuf won't call ReadPixelsFromEglImage
-  bool skip_pixel_readback_ = false;
+  // Atomic: set on the raster thread when Flutter's display rejects WPE's
+  // buffers, read on the thread that delivers WPE frames.
+  std::atomic<bool> skip_pixel_readback_{false};
 
   // View dimensions
   int width_ = 800;
@@ -728,6 +738,11 @@ class InAppWebView {
   bool OnPointerLockRequest(bool lock);
 
  private:
+#ifdef HAVE_WPE_PLATFORM
+  // Converts buffer to RGBA in the next pixel buffer and publishes it.
+  // Caller holds wpe_buffer_mutex_.
+  bool StorePixelsFromBuffer(WPEBuffer* buffer, uint32_t width, uint32_t height);
+#endif
   static void OnFrameDisplayed(void* data);
 
   // Read pixels from EGL image to CPU buffer
